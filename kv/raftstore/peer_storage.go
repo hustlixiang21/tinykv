@@ -308,6 +308,50 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	// 如果没有新条目，则直接返回
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// 获取新日志条目的起始和结束索引
+	newFirstIndex := entries[0].Index
+	newLastIndex := entries[len(entries)-1].Index
+
+	// 获取当前存储的日志条目的起始和结束索引
+	currentFirstIndex, _ := ps.FirstIndex()
+	currentLastIndex, _ := ps.LastIndex()
+
+	// 如果新条目的最后一个索引小于当前存储的第一个索引，则无需任何操作
+	if newLastIndex < currentFirstIndex {
+		log.Info("newLastIndex:%d < currentFirstIndex:%d", newLastIndex, currentFirstIndex)
+		return nil
+	}
+
+	// 如果新条目的第一个索引小于当前存储的第一个索引，调整新条目的起始位置
+	if newFirstIndex < currentFirstIndex {
+		entries = entries[currentFirstIndex-newFirstIndex:]
+	}
+
+	// 将新条目添加到写入批次中
+	for _, entry := range entries {
+		err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+		if err != nil {
+			log.Error("Failed to set Raft log entry: ", err)
+			return err
+		}
+	}
+
+	// 删除新条目后面的所有冲突旧条目
+	if newLastIndex < currentLastIndex {
+		for i := newLastIndex + 1; i <= currentLastIndex; i++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+		}
+	}
+
+	// 更新 RaftLocalState
+	ps.raftState.LastIndex = entries[len(entries)-1].Index
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
+
 	return nil
 }
 
@@ -326,12 +370,67 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	return nil, nil
 }
 
-// Save memory states to disk.
+// SaveReadyState Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// 1. 通过 raft.isEmptySnap() 方法判断是否存在 Snapshot，如果有，则调用 ApplySnapshot() 方法应用（2C）；
+// 2. 调用 Append() 将需要持久化的 entries 保存到 raftDB；
+// 3. 保存 ready 中的 HardState 到 ps.raftState.HardState，注意先使用 raft.isEmptyHardState() 进行判空；
+// 4. 持久化 RaftLocalState 到 raftDB；
+// 5. 通过 WriteRaft 和 WriteKV 进行数据库写入。
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+
+	// 创建用于 Raft 和 KV 引擎的写入批次
+	raftWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
+
+	// 用于存储应用快照的结果（如果有的话）
+	var applySnapResult *ApplySnapResult
+
+	// 1. 将日志条目追加到 Raft 引擎
+	if len(ready.Entries) > 0 {
+		err := ps.Append(ready.Entries, raftWB)
+		if err != nil {
+			log.Error("Failed to append entries: ", err)
+			return applySnapResult, err
+		}
+	}
+
+	// 2. 如果有快照，则应用快照
+	// TODO 完成ApplySnapshot
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		// 将快照应用到 KV 引擎
+		applySnapResult, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			log.Error("Failed to apply snapshot: ", err)
+			return applySnapResult, err
+		}
+	}
+
+	// 3. 将 HardState 保存到 RaftLocalState
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// 4. 更新 RaftLocalState 到 raftWB
+	err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	if err != nil {
+		log.Error("Failed to set Raft state: ", err)
+		return applySnapResult, err
+	}
+
+	// 5. 将 raftWB 和 kvWB 写入DB
+	if err := ps.Engines.WriteRaft(raftWB); err != nil {
+		log.Error("Failed to write Raft batch: ", err)
+		return applySnapResult, err
+	}
+	if err := ps.Engines.WriteKV(kvWB); err != nil {
+		log.Error("Failed to write KV batch: ", err)
+		return applySnapResult, err
+	}
+
+	return applySnapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {

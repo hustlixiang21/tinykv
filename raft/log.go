@@ -158,6 +158,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 
 // FirstIndex return the first index of the log entries
 func (l *RaftLog) FirstIndex() uint64 {
+	// Your Code Here (2A).
 	if len(l.entries) == 0 {
 		index, _ := l.storage.FirstIndex()
 		return index
@@ -168,7 +169,6 @@ func (l *RaftLog) FirstIndex() uint64 {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-
 	// 如果 entries 为空，则表示所有的日志条目都已经被压缩到 snapshot 中
 	if len(l.entries) == 0 {
 		// 从持久化存储中获取最后一个日志条目的索引
@@ -183,7 +183,6 @@ func (l *RaftLog) LastIndex() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-
 	// 如果内存中的日志条目不为空
 	if len(l.entries) > 0 {
 		// 获取内存中日志条目的第一个索引和最后一个索引

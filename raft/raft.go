@@ -227,7 +227,9 @@ func (r *Raft) sendAppend(to uint64) bool {
 	firstIndex := r.RaftLog.FirstIndex()
 	var entries []*pb.Entry
 	for i := id.Next; i < r.RaftLog.LastIndex()+1; i++ {
-		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
+		if i-firstIndex >= 0 {
+			entries = append(entries, &r.RaftLog.entries[i-firstIndex])
+		}
 	}
 
 	msg := pb.Message{
@@ -274,7 +276,7 @@ func (r *Raft) sendAppendResponse(to uint64, index uint64, reject bool) {
 	return
 }
 
-// broadcastAppend 用于 Leader 向所有的 Follower 广播发送心跳包
+// broadcastHeartBeat 用于 Leader 向所有的 Follower 广播发送心跳包
 func (r *Raft) broadcastHeartBeat() {
 	for id := range r.Prs {
 		if id != r.id {
@@ -365,6 +367,7 @@ func (r *Raft) sendRequestVoteResponse(to uint64, reject bool) {
 }
 
 /******** 随机数生成 ********/
+
 type lockedRand struct {
 	mu   sync.Mutex
 	rand *rand.Rand
@@ -408,7 +411,10 @@ func (r *Raft) tick() {
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
 			// 使用MsgBeat触发发送心跳消息
-			_ = r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+			if err != nil {
+				return
+			}
 		}
 	}
 }
@@ -507,6 +513,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
+	case pb.MessageType_MsgPropose:
+		return ErrProposalDropped
 	}
 	return err
 }
@@ -528,6 +536,8 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
+	case pb.MessageType_MsgPropose:
+		return ErrProposalDropped
 	}
 	return err
 }
