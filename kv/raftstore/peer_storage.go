@@ -367,7 +367,60 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	// 来自white paper的提示，要先判断是否initialized
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			log.Panic(err)
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	var applySnapResult *ApplySnapResult
+
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+
+	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
+	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	// raftDB RaftLocalState
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.GetRegion().GetId()), ps.raftState); err != nil {
+		log.Errorf("save raft state failed: %v", err)
+		return applySnapResult, err
+	}
+
+	// kvDB RaftApplyState
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.GetRegion().GetId()), ps.applyState); err != nil {
+		log.Errorf("save region apply state failed, %v", err)
+		return applySnapResult, err
+	}
+
+	// kvDB RegionLocalState
+	meta.WriteRegionState(kvWB, snapData.GetRegion(), rspb.PeerState_Normal)
+
+	NotifierCh := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.GetId(),
+		Notifier: NotifierCh,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+
+	if !(<-NotifierCh) {
+		return applySnapResult, errors.New("apply snap failed")
+	}
+
+	applySnapResult = &ApplySnapResult{
+		Region:     snapData.Region,
+		PrevRegion: ps.Region(),
+	}
+
+	return applySnapResult, nil
 }
 
 // SaveReadyState Save memory states to disk.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -62,7 +63,14 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 		// TODO 处理快照的返回结果，2C处理
 		if applySnapResult != nil {
-
+			if !reflect.DeepEqual(applySnapResult.PrevRegion, applySnapResult.Region) {
+				d.peerStorage.SetRegion(applySnapResult.Region)
+				d.ctx.storeMeta.Lock()
+				d.ctx.storeMeta.regions[applySnapResult.Region.Id] = applySnapResult.Region
+				d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapResult.PrevRegion})
+				d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapResult.Region})
+				d.ctx.storeMeta.Unlock()
+			}
 		}
 
 		// 把ready中的信息发送出去

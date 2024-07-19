@@ -167,6 +167,12 @@ func (rn *RawNode) Ready() Ready {
 		rd.Messages = nil
 	}
 
+	// 检查快照状态的变化
+	if !IsEmptySnap(rn.Raft.RaftLog.pendingSnapshot) {
+		// 需要解引用才能类型匹配
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
+
 	// 检查硬状态是否有变化
 	if hardSt := rn.Raft.hardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
 		rd.HardState = hardSt  // 更新 Ready 中的硬状态
@@ -234,6 +240,12 @@ func (rn *RawNode) Advance(rd Ready) {
 
 	// 清空消息
 	rn.Raft.msgs = nil
+
+	// 丢弃已被压缩的日志
+	rn.Raft.RaftLog.maybeCompact()
+
+	// 重置待应用snapshot
+	rn.Raft.RaftLog.pendingSnapshot = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this

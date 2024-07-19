@@ -15,8 +15,8 @@
 package raft
 
 import (
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"log"
 )
 
 // RaftLog manage the log entries, its struct look like:
@@ -106,6 +106,26 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	// 获取已被压缩的日志的下一个索引，即持久化的第一个索引
+	compacted, err := l.storage.FirstIndex()
+	if err != nil {
+		log.Errorf("Could not find lastindex in storage")
+		return
+	}
+	if len(l.entries) > 0 {
+		if compacted > l.LastIndex() {
+			// 舍弃整个entry
+			l.entries = []pb.Entry{}
+			return
+		} else if compacted >= l.FirstIndex() {
+			// 舍弃前面部分
+			l.entries = l.entries[compacted-l.FirstIndex():]
+			return
+		} else {
+			// 不用舍弃
+			return
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.

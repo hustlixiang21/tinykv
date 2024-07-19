@@ -221,7 +221,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 	prevLogIndex := id.Next - 1
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+
+	// 如果最后一个索引小于快照的索引，则发送快照
+	if err != nil || r.RaftLog.FirstIndex()-1 > prevLogIndex {
+		r.sendSnapshot(to)
+		return false
+	}
 
 	// 将未完成同步的部分都发给对方
 	firstIndex := r.RaftLog.FirstIndex()
@@ -377,6 +383,33 @@ func (r *Raft) sendRequestVoteResponse(to uint64, reject bool) {
 	r.msgs = append(r.msgs, msg)
 }
 
+// 发快照
+func (r *Raft) sendSnapshot(to uint64) {
+	var snapshot pb.Snapshot
+	var err error
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		snapshot = *r.RaftLog.pendingSnapshot
+	} else {
+		snapshot, err = r.RaftLog.storage.Snapshot()
+	}
+
+	if err != nil {
+		return
+	}
+
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+		To:       to,
+		From:     r.id,
+	}
+
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+	return
+}
+
 /******** 随机数生成 ********/
 
 type lockedRand struct {
@@ -518,10 +551,10 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
-	case pb.MessageType_MsgSnapshot:
-		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
 	case pb.MessageType_MsgPropose:
@@ -541,10 +574,10 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleRequestVoteResponse(m)
-	case pb.MessageType_MsgSnapshot:
-		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
 	case pb.MessageType_MsgPropose:
@@ -566,12 +599,12 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.handleAppendEntriesResponse(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
-	case pb.MessageType_MsgSnapshot:
-		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatResponse(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
 	}
@@ -833,6 +866,66 @@ func (r *Raft) maybeCommit() {
 	}
 }
 
+// handleSnapshot handle Snapshot RPC request
+func (r *Raft) handleSnapshot(m pb.Message) {
+	// Your Code Here (2C).
+	if r.Term < m.Term {
+		r.Term = m.Term
+		if r.State != StateFollower {
+			r.becomeFollower(r.Term, m.From)
+		}
+	}
+
+	lastSnapShotIndex := m.Snapshot.Metadata.Index
+
+	// 如果snapshot还没应用，直接返回
+	if lastSnapShotIndex < r.RaftLog.committed {
+		return
+	}
+
+	// 记录Leader
+	if r.Lead != m.From {
+		r.Lead = m.From
+	}
+
+	// 舍弃打了快照的entry
+	if len(r.RaftLog.entries) > 0 {
+		if lastSnapShotIndex >= r.RaftLog.LastIndex() {
+			r.RaftLog.entries = []pb.Entry{}
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[lastSnapShotIndex-r.RaftLog.FirstIndex()+1:]
+		}
+	}
+
+	// 更新日志索引
+	r.RaftLog.applied = lastSnapShotIndex
+	r.RaftLog.committed = lastSnapShotIndex
+	r.RaftLog.stabled = lastSnapShotIndex
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	// 在entry里加一个entry让其和SnapShot的最后一个相同
+	if r.RaftLog.LastIndex() < lastSnapShotIndex {
+		entry := pb.Entry{
+			EntryType: pb.EntryType_EntryNormal, // 普通日志条目类型
+			Index:     lastSnapShotIndex,        // 条目的索引与快照的最后一个条目相同
+			Term:      lastSnapShotIndex,        // 条目的任期与快照的最后一个条目相同
+		}
+		r.RaftLog.entries = append(r.RaftLog.entries, entry) // 将条目追加到日志中
+	}
+
+	// 处理ConfState集群节点变更
+	if m.Snapshot.Metadata.ConfState != nil {
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range m.Snapshot.Metadata.ConfState.Nodes {
+			r.Prs[node] = &Progress{}
+			r.Prs[node].Match = 0
+			r.Prs[node].Next = r.RaftLog.LastIndex() + 1
+		}
+	}
+
+	r.sendAppendResponse(m.From, r.RaftLog.LastIndex(), false)
+}
+
 // softState 保存当前易失性状态
 func (r *Raft) softState() *SoftState {
 	return &SoftState{
@@ -848,12 +941,6 @@ func (r *Raft) hardState() pb.HardState {
 		Vote:   r.Vote,              // 任期内投票给的候选人 ID
 		Commit: r.RaftLog.committed, // 已提交的日志条目的索引
 	}
-}
-
-// handleSnapshot handle Snapshot RPC request
-func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
-
 }
 
 // addNode add a new node to raft group
