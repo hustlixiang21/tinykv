@@ -16,8 +16,8 @@ package raft
 
 import (
 	"errors"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -225,13 +225,24 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	// 将未完成同步的部分都发给对方
 	firstIndex := r.RaftLog.FirstIndex()
-	var entries []*pb.Entry
-	for i := id.Next; i < r.RaftLog.LastIndex()+1; i++ {
-		if i-firstIndex >= 0 {
-			entries = append(entries, &r.RaftLog.entries[i-firstIndex])
-		}
-	}
+	lastIndex := r.RaftLog.LastIndex()
 
+	// 确保 firstIndex 和 lastIndex 在有效范围内
+	if id.Next > lastIndex+1 {
+		log.Infof("id.Next: %d > lastIndex: %d", id.Next, lastIndex+1)
+		return false
+	}
+	if firstIndex > lastIndex {
+		log.Infof("Last index: %d < first index: %d", lastIndex, firstIndex)
+		return false
+	}
+	var entries []*pb.Entry
+	for i := id.Next; i <= lastIndex; i++ {
+		if i-firstIndex >= uint64(len(r.RaftLog.entries)) {
+			break
+		}
+		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
+	}
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgAppend, // 消息类型：日志追加
 		To:      to,                       // 目标节点ID

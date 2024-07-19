@@ -60,7 +60,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			return
 		}
 
-		// TODO: 处理快照的返回结果，2C处理
+		// TODO 处理快照的返回结果，2C处理
 		if applySnapResult != nil {
 
 		}
@@ -71,7 +71,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// 应用已提交的日志条目到 kvDB
 		for _, committedEntry := range ready.CommittedEntries {
 			if committedEntry.EntryType == pb.EntryType_EntryConfChange {
-				// 处理配置变更条目
+				// TODO 处理配置变更条目
 				var cc pb.ConfChange
 				err := cc.Unmarshal(committedEntry.Data)
 				if err != nil {
@@ -147,7 +147,7 @@ func (d *peerMsgHandler) handleGetReq(entry *pb.Entry, req *raft_cmdpb.Request) 
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValidate(cmdResp, entry)
+	d.checkValid(cmdResp, entry)
 
 	// 打印日志
 	// log.Infof("Get request handled: CF=%s, Key=%s, Value=%s", req.Get.Cf, req.Get.Key, value)
@@ -167,7 +167,7 @@ func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, 
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValidate(cmdResp, entry)
+	d.checkValid(cmdResp, entry)
 
 	// 打印日志
 	// log.Infof("Put request handled: CF=%s, Key=%s, Value=%s", req.Put.Cf, req.Put.Key, req.Put.Value)
@@ -187,7 +187,7 @@ func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Reques
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValidate(cmdResp, entry)
+	d.checkValid(cmdResp, entry)
 
 	// 打印日志
 	// log.Infof("Delete request handled: CF=%s, Key=%s", req.Delete.Cf, req.Delete.Key)
@@ -204,13 +204,13 @@ func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdR
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValidate(cmdResp, entry, true)
+	d.checkValid(cmdResp, entry, true)
 
 	// 打印日志
 	// log.Infof("Snap request handled!")
 }
 
-func (d *peerMsgHandler) checkValidate(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, isSnapReq ...interface{}) {
+func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, isSnapReq ...interface{}) {
 	if len(d.proposals) > 0 {
 		d.checkOutdated(entry)
 		if len(d.proposals) == 0 {
@@ -225,12 +225,12 @@ func (d *peerMsgHandler) checkValidate(resp *raft_cmdpb.RaftCmdResponse, entry *
 
 		// term 不匹配
 		if p.term != entry.Term {
-			// ErrStaleCommand：可能由于领导者更改，一些日志未提交并被新领导者的日志覆盖。
-			// 但客户端不知道这一点，仍在等待响应。因此，你应返回此错误让客户端知道并重试命令。
 			NotifyStaleReq(entry.Term, p.cb)
 			d.proposals = d.proposals[1:]
 			return
 		}
+
+		// 如果是快照请求，则需要创建快照事务
 		if len(isSnapReq) > 0 {
 			p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 		}
@@ -249,6 +249,8 @@ func (d *peerMsgHandler) checkOutdated(entry *pb.Entry) {
 			p := d.proposals[current]
 			if p.index < entry.Index {
 				// 处理过时的 proposal，返回 ErrStaleCommand 错误
+				// ErrStaleCommand：可能由于领导者更改，一些日志未提交并被新领导者的日志覆盖。
+				// 但客户端不知道这一点，仍在等待响应。因此，你应返回此错误让客户端知道并重试命令。
 				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
 				current++
 			} else {
@@ -327,6 +329,29 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+func (d *peerMsgHandler) checkReqValid(request *raft_cmdpb.Request) (bool, error) {
+	var key []byte
+	switch request.CmdType {
+	case raft_cmdpb.CmdType_Invalid:
+		return false, fmt.Errorf("invalid CmdType")
+	case raft_cmdpb.CmdType_Get:
+		key = request.Get.Key
+	case raft_cmdpb.CmdType_Put:
+		key = request.Put.Key
+	case raft_cmdpb.CmdType_Delete:
+		key = request.Delete.Key
+	}
+
+	// 检查关键字是否在 Region 中
+	err := util.CheckKeyInRegion(key, d.Region())
+
+	if err != nil && request.CmdType != raft_cmdpb.CmdType_Snap {
+		return false, err
+	}
+
+	return true, err
+}
+
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
@@ -335,19 +360,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 	// Your Code Here (2B).
 	for _, req := range msg.Requests {
-		var key []byte
-		switch req.CmdType {
-		case raft_cmdpb.CmdType_Get:
-			key = req.Get.Key
-		case raft_cmdpb.CmdType_Put:
-			key = req.Put.Key
-		case raft_cmdpb.CmdType_Delete:
-			key = req.Delete.Key
-		}
-
-		// 检查关键字是否在 Region 中
-		err = util.CheckKeyInRegion(key, d.Region())
-		if err != nil && req.CmdType != raft_cmdpb.CmdType_Snap {
+		// 初步检查请求是否合法
+		valid, err := d.checkReqValid(req)
+		if !valid {
 			cb.Done(ErrResp(err))
 			continue
 		}
