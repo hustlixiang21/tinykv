@@ -211,59 +211,38 @@ func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdR
 }
 
 func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, isSnapReq ...interface{}) {
-	if len(d.proposals) > 0 {
-		d.checkOutdated(entry)
-		if len(d.proposals) == 0 {
-			return
-		}
-		p := d.proposals[0]
+	for len(d.proposals) > 0 {
+		proposal := d.proposals[0]
 
-		// index 不匹配
-		if p.index > entry.Index {
+		if entry.Term < proposal.term {
 			return
 		}
 
-		// term 不匹配
-		if p.term != entry.Term {
-			NotifyStaleReq(entry.Term, p.cb)
+		if entry.Term > proposal.term {
+			proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+			d.proposals = d.proposals[1:]
+			continue
+		}
+
+		if entry.Term == proposal.term && entry.Index < proposal.index {
+			return
+		}
+
+		if entry.Term == proposal.term && entry.Index > proposal.index {
+			proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+			d.proposals = d.proposals[1:]
+			continue
+		}
+
+		if entry.Index == proposal.index && entry.Term == proposal.term {
+			// 如果是快照请求，则需要创建快照事务
+			if len(isSnapReq) > 0 {
+				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			}
+			proposal.cb.Done(resp)
 			d.proposals = d.proposals[1:]
 			return
 		}
-
-		// 如果是快照请求，则需要创建快照事务
-		if len(isSnapReq) > 0 {
-			p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-		}
-		p.cb.Done(resp)
-		d.proposals = d.proposals[1:]
-	}
-}
-
-// checkOutdated 检查并移除过时的 proposal
-func (d *peerMsgHandler) checkOutdated(entry *pb.Entry) {
-	proposalCount := len(d.proposals)
-	if proposalCount > 0 {
-		current := 0
-		// 遍历所有 proposals，找到过时的 proposal
-		for current < proposalCount {
-			p := d.proposals[current]
-			if p.index < entry.Index {
-				// 处理过时的 proposal，返回 ErrStaleCommand 错误
-				// ErrStaleCommand：可能由于领导者更改，一些日志未提交并被新领导者的日志覆盖。
-				// 但客户端不知道这一点，仍在等待响应。因此，你应返回此错误让客户端知道并重试命令。
-				p.cb.Done(ErrResp(&util.ErrStaleCommand{}))
-				current++
-			} else {
-				break
-			}
-		}
-		// 如果所有 proposal 都过时，则清空 proposals
-		if current == proposalCount {
-			d.proposals = make([]*proposal, 0)
-			return
-		}
-		// 保留未过时的 proposals
-		d.proposals = d.proposals[current:]
 	}
 }
 
