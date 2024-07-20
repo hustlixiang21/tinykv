@@ -223,7 +223,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := id.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 
-	// 如果最后一个索引小于快照的索引，则发送快照
+	// 如果最后一个索引小于快照的索引，则发送快照，因为此时该entry已经被丢弃，无法访问
 	if err != nil || r.RaftLog.FirstIndex()-1 > prevLogIndex {
 		r.sendSnapshot(to)
 		return false
@@ -383,7 +383,7 @@ func (r *Raft) sendRequestVoteResponse(to uint64, reject bool) {
 	r.msgs = append(r.msgs, msg)
 }
 
-// 发快照
+// sendSnapshot 发送快照给其他结点
 func (r *Raft) sendSnapshot(to uint64) {
 	var snapshot pb.Snapshot
 	var err error
@@ -405,8 +405,8 @@ func (r *Raft) sendSnapshot(to uint64) {
 		From:     r.id,
 	}
 
-	r.msgs = append(r.msgs, msg)
 	r.Prs[to].Next = snapshot.Metadata.Index + 1
+	r.msgs = append(r.msgs, msg)
 	return
 }
 

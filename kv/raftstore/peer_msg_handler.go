@@ -61,7 +61,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			return
 		}
 
-		// TODO 处理快照的返回结果，2C处理
 		if applySnapResult != nil {
 			if !reflect.DeepEqual(applySnapResult.PrevRegion, applySnapResult.Region) {
 				d.peerStorage.SetRegion(applySnapResult.Region)
@@ -79,7 +78,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// 应用已提交的日志条目到 kvDB
 		for _, committedEntry := range ready.CommittedEntries {
 			if committedEntry.EntryType == pb.EntryType_EntryConfChange {
-				// TODO 处理配置变更条目
+				// TODO 处理配置变更条目逻辑
 				var cc pb.ConfChange
 				err := cc.Unmarshal(committedEntry.Data)
 				if err != nil {
@@ -201,6 +200,7 @@ func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Reques
 	// log.Infof("Delete request handled: CF=%s, Key=%s", req.Delete.Cf, req.Delete.Key)
 }
 
+// handleSnapReq 处理scan请求
 func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdRequest) {
 	resp := []*raft_cmdpb.Response{{
 		CmdType: raft_cmdpb.CmdType_Snap,
@@ -243,7 +243,6 @@ func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.
 		}
 
 		if entry.Index == proposal.index && entry.Term == proposal.term {
-			// 如果是快照请求，则需要创建快照事务
 			if len(isSnapReq) > 0 {
 				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 			}
