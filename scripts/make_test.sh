@@ -11,11 +11,16 @@ test_count=$2
 thread_count=$3
 output_file="test_output.txt"
 time_file="time_output.txt"
+output_dir="test_output"
+
+# 创建输出目录
+mkdir -p "$output_dir"
 
 # 定义单个测试函数
 run_test() {
     local test_num=$1
     local projectname=$2
+    local output_dir=$3
 
     echo "Running test $test_num for project $projectname..."
     start_time=$(date +%s.%N)
@@ -26,6 +31,7 @@ run_test() {
     if echo "$output" | grep -qiE "fail|error|fatal"; then
         echo "Test $test_num failed."
         echo "failed" >> "$output_file"
+        echo "$output" > "${output_dir}/output_${projectname}_${test_num}.log"
     else
         echo "Test $test_num succeeded."
         echo "succeeded" >> "$output_file"
@@ -38,13 +44,14 @@ cd ..
 export -f run_test
 export output_file
 export time_file
+export output_dir
 
 # 清空输出文件
 true > "$output_file"
 true > "$time_file"
 
 # 使用 GNU Parallel 进行并行测试，并禁用引用消息
-seq 1 "$test_count" | parallel --no-notice -j "$thread_count" run_test {} "$projectname"
+seq 1 "$test_count" | parallel --no-notice -j "$thread_count" run_test {} "$projectname" "$output_dir"
 
 # 统计结果
 success_count=$(grep -c "succeeded" "$output_file")
@@ -67,5 +74,6 @@ echo "Success rate: $success_rate%"
 echo "Total time: $total_time seconds"
 echo "Average time per test: $average_time seconds"
 
-rm output_file
-rm time_file
+# 删除临时文件
+rm -f "$output_file"
+rm -f "$time_file"
