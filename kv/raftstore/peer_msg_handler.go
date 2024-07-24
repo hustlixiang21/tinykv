@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"reflect"
@@ -61,6 +62,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			return
 		}
 
+		// 根据日志应用结果调整ctx
 		if applySnapResult != nil {
 			if !reflect.DeepEqual(applySnapResult.PrevRegion, applySnapResult.Region) {
 				d.peerStorage.SetRegion(applySnapResult.Region)
@@ -77,26 +79,22 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 		// 应用已提交的日志条目到 kvDB
 		for _, committedEntry := range ready.CommittedEntries {
+			kvWB := new(engine_util.WriteBatch)
+
 			if committedEntry.EntryType == pb.EntryType_EntryConfChange {
 				// TODO 处理配置变更条目逻辑
 				var cc pb.ConfChange
 				err := cc.Unmarshal(committedEntry.Data)
 				if err != nil {
-					log.Error("Failed to unmarshal conf change: ", err)
+					log.Errorf("Failed to unmarshal conf change: %v", err)
 					return
 				}
 				d.RaftGroup.ApplyConfChange(cc)
 			} else {
 				// 处理普通条目
-				kvWB := new(engine_util.WriteBatch)
 				err := d.applyEntry(&committedEntry, kvWB)
 				if err != nil {
-					log.Error("Failed to apply entry: ", err)
-					return
-				}
-				err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
-				if err != nil {
-					log.Error("Failed to write to KV DB: ", err)
+					log.Errorf("Failed to apply entry: %v", err)
 					return
 				}
 			}
@@ -104,33 +102,75 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			d.peerStorage.applyState.AppliedIndex = committedEntry.Index
 		}
 
+		// 推进状态
 		d.RaftGroup.Advance(ready)
 	}
 }
 
 // applyEntry 应用日志条目到 kvDB
 func (d *peerMsgHandler) applyEntry(entry *pb.Entry, kvWB *engine_util.WriteBatch) error {
-	var msg raft_cmdpb.RaftCmdRequest
-	err := msg.Unmarshal(entry.Data)
+	// 反序列化cmdRequest
+	var cmdRequest raft_cmdpb.RaftCmdRequest
+	err := cmdRequest.Unmarshal(entry.Data)
 	if err != nil {
 		return err
 	}
 
-	for _, request := range msg.Requests {
-		switch request.CmdType {
-		case raft_cmdpb.CmdType_Get:
-			d.handleGetReq(entry, request)
-		case raft_cmdpb.CmdType_Put:
-			d.handlePutReq(entry, request, kvWB)
-		case raft_cmdpb.CmdType_Delete:
-			d.handleDeleteReq(entry, request, kvWB)
-		case raft_cmdpb.CmdType_Snap:
-			d.handleSnapReq(entry, &msg)
-		case raft_cmdpb.CmdType_Invalid:
-			log.Error("Invalid cmd type")
+	// 处理admin请求
+	if cmdRequest.AdminRequest != nil {
+		adminRequest := cmdRequest.GetAdminRequest()
+		switch adminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			d.handleCompactLog(entry, adminRequest, kvWB)
+		case raft_cmdpb.AdminCmdType_InvalidAdmin:
+			err = fmt.Errorf("invalid admin cmd Type: %v", adminRequest)
+			log.Error(err)
+		}
+	} else {
+		for _, request := range cmdRequest.GetRequests() {
+			switch request.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				d.handleGetReq(entry, request)
+			case raft_cmdpb.CmdType_Put:
+				d.handlePutReq(entry, request, kvWB)
+			case raft_cmdpb.CmdType_Delete:
+				d.handleDeleteReq(entry, request, kvWB)
+			case raft_cmdpb.CmdType_Snap:
+				d.handleSnapReq(entry, &cmdRequest)
+			case raft_cmdpb.CmdType_Invalid:
+				err = fmt.Errorf("invalid normal cmd type: %v", request)
+				log.Error(err)
+			}
 		}
 	}
-	return nil
+
+	return err
+}
+
+// handleCompactLog 处理admin类型的日志压缩请求
+func (d *peerMsgHandler) handleCompactLog(entry *pb.Entry, req *raft_cmdpb.AdminRequest, wb *engine_util.WriteBatch) {
+	CompactIndex := req.GetCompactLog().CompactIndex
+
+	if CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = CompactIndex
+		d.peerStorage.applyState.TruncatedState.Term = req.GetCompactLog().CompactTerm
+		err := wb.SetMeta(meta.ApplyStateKey(d.Region().GetId()), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+			return
+		}
+		d.ScheduleCompactLog(CompactIndex)
+	}
+
+	adminResp := &raft_cmdpb.AdminResponse{
+		CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+		CompactLog: &raft_cmdpb.CompactLogResponse{},
+	}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:        &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: adminResp,
+	}
+	d.checkValid(cmdResp, entry)
 }
 
 // handleGetReq 处理Get请求
@@ -156,7 +196,6 @@ func (d *peerMsgHandler) handleGetReq(entry *pb.Entry, req *raft_cmdpb.Request) 
 	}
 	d.checkValid(cmdResp, entry)
 
-	// 打印日志
 	// log.Infof("Get request handled: CF=%s, Key=%s, Value=%s", req.Get.Cf, req.Get.Key, value)
 }
 
@@ -175,8 +214,9 @@ func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, 
 		Responses: resp,
 	}
 	d.checkValid(cmdResp, entry)
+	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+	kvWB.Reset()
 
-	// 打印日志
 	// log.Infof("Put request handled: CF=%s, Key=%s, Value=%s", req.Put.Cf, req.Put.Key, req.Put.Value)
 }
 
@@ -195,8 +235,9 @@ func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Reques
 		Responses: resp,
 	}
 	d.checkValid(cmdResp, entry)
+	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+	kvWB.Reset()
 
-	// 打印日志
 	// log.Infof("Delete request handled: CF=%s, Key=%s", req.Delete.Cf, req.Delete.Key)
 }
 
@@ -214,7 +255,6 @@ func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdR
 	}
 	d.checkValid(cmdResp, entry, true)
 
-	// 打印日志
 	// log.Infof("Snap request handled!")
 }
 

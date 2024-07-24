@@ -6,3 +6,4 @@ bin/*
 _tools
 /vendor
 *_output.txt
+test_output/*
