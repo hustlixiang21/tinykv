@@ -254,7 +254,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		To:      to,                       // 目标节点ID
 		From:    r.id,                     // 发送者节点ID
 		Term:    r.Term,                   // 当前任期
-		LogTerm: prevLogTerm,              // leader上一个日志条目的任期
+		LogTerm: prevLogTerm,              // leader记录的follower上一个日志条目的任期
 		Index:   prevLogIndex,             // leader记录的follower上一个日志条目的索引
 		Entries: entries,                  // 需要复制的日志条目
 		Commit:  r.RaftLog.committed,      // 已提交的日志索引

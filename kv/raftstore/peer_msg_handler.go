@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -126,21 +127,21 @@ func (d *peerMsgHandler) applyEntry(entry *pb.Entry, kvWB *engine_util.WriteBatc
 			err = fmt.Errorf("invalid admin cmd Type: %v", adminRequest)
 			log.Error(err)
 		}
-	} else {
-		for _, request := range cmdRequest.GetRequests() {
-			switch request.CmdType {
-			case raft_cmdpb.CmdType_Get:
-				d.handleGetReq(entry, request)
-			case raft_cmdpb.CmdType_Put:
-				d.handlePutReq(entry, request, kvWB)
-			case raft_cmdpb.CmdType_Delete:
-				d.handleDeleteReq(entry, request, kvWB)
-			case raft_cmdpb.CmdType_Snap:
-				d.handleSnapReq(entry, &cmdRequest)
-			case raft_cmdpb.CmdType_Invalid:
-				err = fmt.Errorf("invalid normal cmd type: %v", request)
-				log.Error(err)
-			}
+	}
+
+	for _, request := range cmdRequest.GetRequests() {
+		switch request.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			d.handleGetReq(entry, request)
+		case raft_cmdpb.CmdType_Put:
+			d.handlePutReq(entry, request, kvWB)
+		case raft_cmdpb.CmdType_Delete:
+			d.handleDeleteReq(entry, request, kvWB)
+		case raft_cmdpb.CmdType_Snap:
+			d.handleSnapReq(entry, &cmdRequest)
+		case raft_cmdpb.CmdType_Invalid:
+			err = fmt.Errorf("invalid normal cmd type: %v", request)
+			log.Error(err)
 		}
 	}
 
@@ -203,6 +204,8 @@ func (d *peerMsgHandler) handleGetReq(entry *pb.Entry, req *raft_cmdpb.Request) 
 func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
 	// 执行Put操作
 	kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+	kvWB.Reset()
 
 	// 构造回应
 	resp := []*raft_cmdpb.Response{{
@@ -214,9 +217,6 @@ func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, 
 		Responses: resp,
 	}
 	d.checkValid(cmdResp, entry)
-	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-	kvWB.Reset()
-
 	// log.Infof("Put request handled: CF=%s, Key=%s, Value=%s", req.Put.Cf, req.Put.Key, req.Put.Value)
 }
 
@@ -224,6 +224,8 @@ func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, 
 func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
 	// 执行Delete操作
 	kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+	kvWB.Reset()
 
 	// 构造回应
 	resp := []*raft_cmdpb.Response{{
@@ -235,9 +237,6 @@ func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Reques
 		Responses: resp,
 	}
 	d.checkValid(cmdResp, entry)
-	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-	kvWB.Reset()
-
 	// log.Infof("Delete request handled: CF=%s, Key=%s", req.Delete.Cf, req.Delete.Key)
 }
 
@@ -253,12 +252,12 @@ func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdR
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValid(cmdResp, entry, true)
+	d.checkValid(cmdResp, entry, d.peerStorage.Engines.Kv.NewTransaction(false))
 
 	// log.Infof("Snap request handled!")
 }
 
-func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, isSnapReq ...interface{}) {
+func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, snapTxn ...*badger.Txn) {
 	for len(d.proposals) > 0 {
 		proposal := d.proposals[0]
 
@@ -283,8 +282,8 @@ func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.
 		}
 
 		if entry.Index == proposal.index && entry.Term == proposal.term {
-			if len(isSnapReq) > 0 {
-				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+			if snapTxn != nil {
+				proposal.cb.Txn = snapTxn[0]
 			}
 			proposal.cb.Done(resp)
 			d.proposals = d.proposals[1:]
