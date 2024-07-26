@@ -259,12 +259,20 @@ func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrp
 
 	kvPairs := make([]*kvrpcpb.KvPair, 0, req.Limit)
 	for i := uint32(0); i < req.Limit; i++ {
+		// 获取Write下一对key/value
 		key, value, err := scanner.Next()
 		if err != nil {
 			return resp, err
 		}
+
+		// Next函数仅在迭代器无效的时候返回key=nil，可以作为结束break的条件
 		if key == nil {
 			break
+		}
+
+		// 处理删除类型的写
+		if value == nil {
+			continue
 		}
 
 		// 检查是否有锁
