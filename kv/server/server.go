@@ -270,7 +270,7 @@ func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrp
 			break
 		}
 
-		// 处理删除类型的写
+		// 处理删除类型的提交
 		if value == nil {
 			continue
 		}
@@ -460,28 +460,28 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 	}
 
 	if req.CommitVersion == 0 {
-		// 执行回滚
-		rbReq := &kvrpcpb.BatchRollbackRequest{
+		// 全部回滚
+		rollbackReq := &kvrpcpb.BatchRollbackRequest{
 			Keys:         keys,
 			StartVersion: txn.StartTS,
 			Context:      req.Context,
 		}
-		rbResp, err := server.KvBatchRollback(nil, rbReq)
+		rbResp, err := server.KvBatchRollback(nil, rollbackReq)
 		if err != nil {
 			return resp, err
 		}
 		resp.Error = rbResp.Error
 		resp.RegionError = rbResp.RegionError
 		return resp, nil
-	} else if req.CommitVersion > 0 {
-		// 提交锁
-		cmReq := &kvrpcpb.CommitRequest{
+	} else {
+		// 全部提交
+		commitReq := &kvrpcpb.CommitRequest{
 			Keys:          keys,
 			StartVersion:  txn.StartTS,
 			CommitVersion: req.CommitVersion,
 			Context:       req.Context,
 		}
-		cmResp, err := server.KvCommit(nil, cmReq)
+		cmResp, err := server.KvCommit(nil, commitReq)
 		if err != nil {
 			return resp, err
 		}
@@ -489,8 +489,6 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 		resp.RegionError = cmResp.RegionError
 		return resp, nil
 	}
-
-	return resp, nil
 }
 
 // Coprocessor SQL push down commands.
