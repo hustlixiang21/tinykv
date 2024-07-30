@@ -438,10 +438,10 @@ func (r *Raft) RandomizedElectionTimeout() {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	r.electionElapsed++
 	switch r.State {
 	// Follower心跳超时和Candidate选举超时都会触发新一轮的选举
 	case StateFollower, StateCandidate:
-		r.electionElapsed++
 		if r.electionElapsed >= r.randomizedTimeout {
 			r.electionElapsed = 0
 			// 通过Step发送开始选举消息
@@ -451,6 +451,12 @@ func (r *Raft) tick() {
 			}
 		}
 	case StateLeader:
+		if r.electionElapsed >= 2*r.electionTimeout {
+			r.electionElapsed = 0
+			// 选举时间内如果没有转移成功，说明目标结点挂掉，置空
+			r.leadTransferee = 0
+		}
+
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
@@ -470,6 +476,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Term = term
 	r.Lead = lead
+	r.leadTransferee = 0
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.RandomizedElectionTimeout()
@@ -482,6 +489,7 @@ func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
 	r.State = StateCandidate
 	r.Term += 1
+	r.leadTransferee = 0
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.RandomizedElectionTimeout()
@@ -496,6 +504,7 @@ func (r *Raft) becomeLeader() {
 	// NOTE: Leader should propose a noop entry on its term
 	r.State = StateLeader
 	r.Lead = r.id
+	r.leadTransferee = 0
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
 	r.RandomizedElectionTimeout()
@@ -557,6 +566,8 @@ func (r *Raft) stepFollower(m pb.Message) error {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
+	case pb.MessageType_MsgTransferLeader:
+		r.sendToLeader(m)
 	case pb.MessageType_MsgPropose:
 		return ErrProposalDropped
 	}
@@ -580,6 +591,8 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		r.handleSnapshot(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
+	case pb.MessageType_MsgTransferLeader:
+		r.sendToLeader(m)
 	case pb.MessageType_MsgPropose:
 		return ErrProposalDropped
 	}
@@ -591,8 +604,6 @@ func (r *Raft) stepLeader(m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgBeat:
 		r.broadcastHeartBeat()
-	case pb.MessageType_MsgPropose:
-		r.handlePropose(m)
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse:
@@ -605,6 +616,15 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgPropose:
+		// 当 Leader 的 leadTransferee 不为空时，不接受任何 propose，因为正在转移
+		if r.leadTransferee != 0 {
+			err = ErrProposalDropped
+		} else {
+			r.handlePropose(m)
+		}
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	case pb.MessageType_MsgTimeoutNow:
 		r.handleStartVote()
 	}
@@ -715,6 +735,19 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 	if r.RaftLog.committed != oldCom {
 		r.broadcastAppend()
 	}
+
+	// 如果是需要transfer的目标，日志复制完成，可以继续transfer
+	if r.leadTransferee == m.From {
+		err := r.Step(pb.Message{
+			MsgType: pb.MessageType_MsgTransferLeader,
+			From:    m.From,
+			To:      r.id,
+		})
+		if err != nil {
+			log.Errorf("failed to send leader transfer msg: %v", err)
+			return
+		}
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -782,6 +815,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			r.sendRequestVoteResponse(m.From, false)
 			// 投票并更新任期然后变换身份
 			r.Vote = m.From
+			log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
 		} else {
 			r.sendRequestVoteResponse(m.From, true)
 		}
@@ -926,6 +960,40 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.sendAppendResponse(m.From, r.RaftLog.LastIndex(), false)
 }
 
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// 检查节点是否在集群中
+	if _, in := r.Prs[m.From]; !in {
+		// log.Errorf("peer not in the cluster")
+		return
+	}
+
+	// 身份不是leader，拒绝
+	if r.State != StateLeader {
+		log.Errorf("%v can not transfer leader", r.State)
+		return
+	}
+
+	//// 转移目标不为空，说明之前正在转移，且转移目标不同，直接忽略
+	//if r.leadTransferee != 0 && r.leadTransferee != m.From {
+	//	log.Infof("%v can not transfer, because %v is transfering", m.From, r.leadTransferee)
+	//	return
+	//}
+
+	// 修改转移目标
+	r.leadTransferee = m.From
+
+	// 如果日志更新则转移leader，否则要帮助其成为leader，即进行日志复制
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			To:      m.From,
+			From:    r.id,
+		})
+	} else {
+		r.sendAppend(m.From)
+	}
+}
+
 // softState 保存当前易失性状态
 func (r *Raft) softState() *SoftState {
 	return &SoftState{
@@ -946,9 +1014,46 @@ func (r *Raft) hardState() pb.HardState {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	// 已经存在直接退出
+	if _, in := r.Prs[id]; in {
+		return
+	}
+
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
+
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	// 不存在直接退出
+	if _, in := r.Prs[id]; !in {
+		return
+	}
+
+	// 删除peer
+	delete(r.Prs, id)
+
+	if len(r.Prs) == 0 {
+		return
+	}
+	// 记录旧的 commited ，尝试更新 committed
+	oldCom := r.RaftLog.committed
+	r.maybeCommit()
+
+	// 如果committed更新，发送 AppendEntries RPC 来通知 Follower 已提交的日志条目。
+	if r.RaftLog.committed != oldCom {
+		r.broadcastAppend()
+	}
+}
+
+// sendToLeader sends a message to leader
+func (r *Raft) sendToLeader(m pb.Message) {
+	if r.Lead != None {
+		m.To = r.Lead
+		r.msgs = append(r.msgs, m)
+	}
 }
