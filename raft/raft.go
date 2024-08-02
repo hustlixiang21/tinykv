@@ -815,7 +815,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 			r.sendRequestVoteResponse(m.From, false)
 			// 投票并更新任期然后变换身份
 			r.Vote = m.From
-			log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
+			// log.Infof("%x vote to %x at term %d\n", r.id, m.From, r.Term)
 		} else {
 			r.sendRequestVoteResponse(m.From, true)
 		}

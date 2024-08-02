@@ -82,20 +82,18 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		for _, committedEntry := range ready.CommittedEntries {
 			kvWB := new(engine_util.WriteBatch)
 
-			if committedEntry.EntryType == pb.EntryType_EntryConfChange {
-				// TODO 处理配置变更条目逻辑
-				var cc pb.ConfChange
-				err := cc.Unmarshal(committedEntry.Data)
+			if committedEntry.EntryType == pb.EntryType_EntryNormal {
+				// 处理普通条目
+				err := d.applyNormalEntry(&committedEntry, kvWB)
 				if err != nil {
-					log.Errorf("Failed to unmarshal conf change: %v", err)
+					log.Errorf("Failed to apply normal entry: %v", err)
 					return
 				}
-				d.RaftGroup.ApplyConfChange(cc)
-			} else {
-				// 处理普通条目
-				err := d.applyEntry(&committedEntry, kvWB)
+			} else if committedEntry.EntryType == pb.EntryType_EntryConfChange {
+				// 处理配置变更条目
+				err := d.applyConfChangeEntry(&committedEntry, kvWB)
 				if err != nil {
-					log.Errorf("Failed to apply entry: %v", err)
+					log.Errorf("Failed to apply confchange entry: %v", err)
 					return
 				}
 			}
@@ -108,8 +106,123 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 }
 
-// applyEntry 应用日志条目到 kvDB
-func (d *peerMsgHandler) applyEntry(entry *pb.Entry, kvWB *engine_util.WriteBatch) error {
+func (d *peerMsgHandler) applyConfChangeEntry(entry *pb.Entry, kvWB *engine_util.WriteBatch) error {
+	// 反序列化cmdRequest
+	var cmdRequest raft_cmdpb.RaftCmdRequest
+	err := cmdRequest.Unmarshal(entry.Data)
+	if err != nil {
+		return err
+	}
+
+	// 反序列化ConfChange
+	var confChange pb.ConfChange
+	err = confChange.Unmarshal(entry.Data)
+	if err != nil {
+		return err
+	}
+
+	// 更新 RegionState
+	switch confChange.ChangeType {
+	case pb.ConfChangeType_AddNode:
+		d.applyAddNode(&confChange, &cmdRequest, kvWB)
+	case pb.ConfChangeType_RemoveNode:
+		d.applyRemoveNode(&confChange, kvWB)
+	}
+
+	// 调用 d.RaftGroup.ApplyConfChange() 方法，修改raft内部的Prs
+	d.RaftGroup.ApplyConfChange(confChange)
+
+	// 更新 scheduler 的 region 缓存，解决可能的 no region 错误
+	d.notifyHeartbeatScheduler(d.Region(), d.peer)
+
+	// 构造ChangePeer类型的AdminResponse
+	adminResp := &raft_cmdpb.AdminResponse{
+		CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+		CompactLog: &raft_cmdpb.CompactLogResponse{},
+	}
+	cmdResp := &raft_cmdpb.RaftCmdResponse{
+		Header:        &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: adminResp,
+	}
+	d.checkValidAndCallback(cmdResp, entry)
+
+	return err
+}
+
+func (d *peerMsgHandler) applyAddNode(cc *pb.ConfChange, req *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) {
+	// 结点不存在才能添加
+	if !d.peer.peerExistInRegion(cc.NodeId) {
+		// 更改 peer 并写入 RegionState
+		d.ctx.storeMeta.Lock()
+		defer d.ctx.storeMeta.Unlock()
+
+		// 更新 RegionEpoch 的 ConfVer
+		region := d.Region()
+		region.RegionEpoch.ConfVer++
+
+		// 添加新的 peer
+		newPeer := &metapb.Peer{
+			Id:      req.AdminRequest.ChangePeer.Peer.Id,
+			StoreId: req.AdminRequest.ChangePeer.Peer.StoreId,
+		}
+		region.Peers = append(region.GetPeers(), newPeer)
+
+		// 持久化修改后的 Region
+		meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+
+		// 加入 peer 缓存
+		d.insertPeerCache(newPeer)
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: d.Region()})
+	}
+}
+
+func (d *peerMsgHandler) applyRemoveNode(cc *pb.ConfChange, kvWB *engine_util.WriteBatch) {
+	// 分为销毁结点自身和其他结点
+	if d.peer.PeerId() == cc.NodeId {
+		// 调用 destroyPeer 删除节点自身
+		d.destroyPeer()
+	} else if d.peerExistInRegion(cc.NodeId) {
+		// 更改 peer 并写入 RegionState
+		d.ctx.storeMeta.Lock()
+		defer d.ctx.storeMeta.Unlock()
+
+		region := d.Region()
+		// 更新 RegionEpoch 的 ConfVer
+		region.RegionEpoch.ConfVer++
+
+		// 删除指定的 peer
+		newPeers := make([]*metapb.Peer, 0, len(region.Peers)-1)
+		for _, pr := range region.Peers {
+			if pr.Id != cc.NodeId {
+				newPeers = append(newPeers, pr)
+			}
+		}
+		region.Peers = newPeers
+
+		// 持久化修改后的 Region
+		meta.WriteRegionState(kvWB, region, rspb.PeerState_Normal)
+
+		// 从 peer 缓存中删除
+		d.removePeerCache(cc.NodeId)
+	}
+}
+
+func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *peer) {
+	clonedRegion := new(metapb.Region)
+	err := util.CloneMsg(region, clonedRegion)
+	if err != nil {
+		return
+	}
+	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
+		Region:          clonedRegion,
+		Peer:            peer.Meta,
+		PendingPeers:    peer.CollectPendingPeers(),
+		ApproximateSize: peer.ApproximateSize,
+	}
+}
+
+// applyNormalEntry 应用具体的日志条目（不同类型的请求）到 kvDB
+func (d *peerMsgHandler) applyNormalEntry(entry *pb.Entry, kvWB *engine_util.WriteBatch) error {
 	// 反序列化cmdRequest
 	var cmdRequest raft_cmdpb.RaftCmdRequest
 	err := cmdRequest.Unmarshal(entry.Data)
@@ -122,7 +235,7 @@ func (d *peerMsgHandler) applyEntry(entry *pb.Entry, kvWB *engine_util.WriteBatc
 		adminRequest := cmdRequest.GetAdminRequest()
 		switch adminRequest.CmdType {
 		case raft_cmdpb.AdminCmdType_CompactLog:
-			d.handleCompactLog(entry, adminRequest, kvWB)
+			d.applyCompactLog(entry, adminRequest, kvWB)
 		case raft_cmdpb.AdminCmdType_InvalidAdmin:
 			err = fmt.Errorf("invalid admin cmd Type: %v", adminRequest)
 			log.Error(err)
@@ -132,13 +245,13 @@ func (d *peerMsgHandler) applyEntry(entry *pb.Entry, kvWB *engine_util.WriteBatc
 	for _, request := range cmdRequest.GetRequests() {
 		switch request.CmdType {
 		case raft_cmdpb.CmdType_Get:
-			d.handleGetReq(entry, request)
+			d.applyGetReq(entry, request)
 		case raft_cmdpb.CmdType_Put:
-			d.handlePutReq(entry, request, kvWB)
+			d.applyPutReq(entry, request, kvWB)
 		case raft_cmdpb.CmdType_Delete:
-			d.handleDeleteReq(entry, request, kvWB)
+			d.applyDeleteReq(entry, request, kvWB)
 		case raft_cmdpb.CmdType_Snap:
-			d.handleSnapReq(entry, &cmdRequest)
+			d.applySnapReq(entry)
 		case raft_cmdpb.CmdType_Invalid:
 			err = fmt.Errorf("invalid normal cmd type: %v", request)
 			log.Error(err)
@@ -148,8 +261,8 @@ func (d *peerMsgHandler) applyEntry(entry *pb.Entry, kvWB *engine_util.WriteBatc
 	return err
 }
 
-// handleCompactLog 处理admin类型的日志压缩请求
-func (d *peerMsgHandler) handleCompactLog(entry *pb.Entry, req *raft_cmdpb.AdminRequest, wb *engine_util.WriteBatch) {
+// applyCompactLog 执行CompactLog类型的请求的具体内容，然后通过回调返回
+func (d *peerMsgHandler) applyCompactLog(entry *pb.Entry, req *raft_cmdpb.AdminRequest, wb *engine_util.WriteBatch) {
 	CompactIndex := req.GetCompactLog().CompactIndex
 
 	if CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
@@ -163,6 +276,7 @@ func (d *peerMsgHandler) handleCompactLog(entry *pb.Entry, req *raft_cmdpb.Admin
 		d.ScheduleCompactLog(CompactIndex)
 	}
 
+	// 构造CompactLog类型的AdminResponse
 	adminResp := &raft_cmdpb.AdminResponse{
 		CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
 		CompactLog: &raft_cmdpb.CompactLogResponse{},
@@ -171,11 +285,11 @@ func (d *peerMsgHandler) handleCompactLog(entry *pb.Entry, req *raft_cmdpb.Admin
 		Header:        &raft_cmdpb.RaftResponseHeader{},
 		AdminResponse: adminResp,
 	}
-	d.checkValid(cmdResp, entry)
+	d.checkValidAndCallback(cmdResp, entry)
 }
 
-// handleGetReq 处理Get请求
-func (d *peerMsgHandler) handleGetReq(entry *pb.Entry, req *raft_cmdpb.Request) {
+// applyGetReq 执行Get请求的具体内容，然后通过回调返回
+func (d *peerMsgHandler) applyGetReq(entry *pb.Entry, req *raft_cmdpb.Request) {
 	// 执行Get操作
 	value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
 	if err != nil {
@@ -183,31 +297,28 @@ func (d *peerMsgHandler) handleGetReq(entry *pb.Entry, req *raft_cmdpb.Request) 
 		return
 	}
 
-	// 构造response
+	// 构造Get类型的response
 	resp := []*raft_cmdpb.Response{{
 		CmdType: raft_cmdpb.CmdType_Get,
 		Get: &raft_cmdpb.GetResponse{
 			Value: value,
 		},
 	}}
-
 	cmdResp := &raft_cmdpb.RaftCmdResponse{
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValid(cmdResp, entry)
-
-	// log.Infof("Get request handled: CF=%s, Key=%s, Value=%s", req.Get.Cf, req.Get.Key, value)
+	d.checkValidAndCallback(cmdResp, entry)
 }
 
-// handlePutReq 处理Put请求
-func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
+// applyPutReq 执行Put请求的具体内容，然后通过回调返回
+func (d *peerMsgHandler) applyPutReq(entry *pb.Entry, req *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
 	// 执行Put操作
 	kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
 	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 	kvWB.Reset()
 
-	// 构造回应
+	// 构造Put类型的response
 	resp := []*raft_cmdpb.Response{{
 		CmdType: raft_cmdpb.CmdType_Put,
 		Put:     &raft_cmdpb.PutResponse{},
@@ -216,18 +327,17 @@ func (d *peerMsgHandler) handlePutReq(entry *pb.Entry, req *raft_cmdpb.Request, 
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValid(cmdResp, entry)
-	// log.Infof("Put request handled: CF=%s, Key=%s, Value=%s", req.Put.Cf, req.Put.Key, req.Put.Value)
+	d.checkValidAndCallback(cmdResp, entry)
 }
 
-// handleDeleteReq 处理Delete请求
-func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
+// applyDeleteReq 执行Delete请求的具体内容，然后通过回调返回
+func (d *peerMsgHandler) applyDeleteReq(entry *pb.Entry, req *raft_cmdpb.Request, kvWB *engine_util.WriteBatch) {
 	// 执行Delete操作
 	kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
 	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 	kvWB.Reset()
 
-	// 构造回应
+	// 构造Delete类型的response
 	resp := []*raft_cmdpb.Response{{
 		CmdType: raft_cmdpb.CmdType_Delete,
 		Delete:  &raft_cmdpb.DeleteResponse{},
@@ -236,12 +346,12 @@ func (d *peerMsgHandler) handleDeleteReq(entry *pb.Entry, req *raft_cmdpb.Reques
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValid(cmdResp, entry)
-	// log.Infof("Delete request handled: CF=%s, Key=%s", req.Delete.Cf, req.Delete.Key)
+	d.checkValidAndCallback(cmdResp, entry)
 }
 
-// handleSnapReq 处理scan请求
-func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdRequest) {
+// applySnapReq 执行scan请求的具体内容，然后通过回调返回
+func (d *peerMsgHandler) applySnapReq(entry *pb.Entry) {
+	// 构造Snap（Scan）类型的response
 	resp := []*raft_cmdpb.Response{{
 		CmdType: raft_cmdpb.CmdType_Snap,
 		Snap: &raft_cmdpb.SnapResponse{
@@ -252,12 +362,10 @@ func (d *peerMsgHandler) handleSnapReq(entry *pb.Entry, msg *raft_cmdpb.RaftCmdR
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: resp,
 	}
-	d.checkValid(cmdResp, entry, d.peerStorage.Engines.Kv.NewTransaction(false))
-
-	// log.Infof("Snap request handled!")
+	d.checkValidAndCallback(cmdResp, entry, d.peerStorage.Engines.Kv.NewTransaction(false))
 }
 
-func (d *peerMsgHandler) checkValid(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, snapTxn ...*badger.Txn) {
+func (d *peerMsgHandler) checkValidAndCallback(resp *raft_cmdpb.RaftCmdResponse, entry *pb.Entry, snapTxn ...*badger.Txn) {
 	for len(d.proposals) > 0 {
 		proposal := d.proposals[0]
 
@@ -365,16 +473,40 @@ func (d *peerMsgHandler) checkReqValid(request *raft_cmdpb.Request) (bool, error
 		key = request.Put.Key
 	case raft_cmdpb.CmdType_Delete:
 		key = request.Delete.Key
+	case raft_cmdpb.CmdType_Snap:
+		return true, nil
 	}
 
 	// 检查关键字是否在 Region 中
 	err := util.CheckKeyInRegion(key, d.Region())
-
-	if err != nil && request.CmdType != raft_cmdpb.CmdType_Snap {
+	if err != nil {
 		return false, err
 	}
 
 	return true, err
+}
+
+// proposeToRaftGroup 将请求转化为字节数组然后创建新的propose交给raft层
+func (d *peerMsgHandler) proposeToRaftGroup(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) error {
+	// 将 Raft 命令请求序列化为字节数组
+	data, err := msg.Marshal()
+	if err != nil {
+		log.Errorf("failed to transfer msg into byte array: %v", err) // 序列化失败，记录错误
+		return err
+	}
+
+	// 创建一个新的提议对象，并添加到提议列表中
+	proposal := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+	d.proposals = append(d.proposals, proposal)
+
+	// 向 Raft 集群提交提议
+	err = d.RaftGroup.Propose(data)
+	if err != nil {
+		log.Errorf("propose failed! %v", err) // 提议失败，记录错误
+		return err
+	}
+
+	return nil
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
@@ -385,6 +517,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 	// Your Code Here (2B).
 	for _, req := range msg.Requests {
+		// 处理Normal类型的请求
 		// 初步检查请求是否合法
 		valid, err := d.checkReqValid(req)
 		if !valid {
@@ -392,23 +525,88 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			continue
 		}
 
-		// 将 Raft 命令请求序列化为字节数组
-		data, err := msg.Marshal()
+		// 请求propose到raft层
+		err = d.proposeToRaftGroup(msg, cb)
 		if err != nil {
-			log.Panic(err) // 序列化失败，记录错误并终止程序
-		}
-
-		// 创建一个新的提议对象，并添加到提议列表中
-		p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
-		d.proposals = append(d.proposals, p)
-
-		// 向 Raft 集群提交提议
-		err = d.RaftGroup.Propose(data)
-		if err != nil {
-			log.Error("propose failed! ", err) // 提议失败，记录错误
+			cb.Done(ErrResp(err))
 			return
 		}
 	}
+
+	if msg.AdminRequest != nil {
+		// 处理Admin类型的请求
+		adminReq := msg.GetAdminRequest()
+		switch adminReq.CmdType {
+		case raft_cmdpb.AdminCmdType_InvalidAdmin:
+			cb.Done(ErrResp(fmt.Errorf("invalid adminCmdType")))
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			d.handleChangePeerReq(msg, adminReq, cb)
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			// TODO 2C encountered a bug
+			// d.handleCompactLogReq(msg, cb)
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			d.handleTransferLeaderReq(adminReq, cb)
+		case raft_cmdpb.AdminCmdType_Split:
+			// TODO 处理分裂结点的请求
+		}
+	}
+}
+
+// handleChangePeerReq 处理AdminCmdType_ChangePeer类型的请求，调用 ProposeConfChange 进行配置更改提议
+func (d *peerMsgHandler) handleChangePeerReq(msg *raft_cmdpb.RaftCmdRequest, adminReq *raft_cmdpb.AdminRequest, cb *message.Callback) {
+	data, err := msg.Marshal()
+	if err != nil {
+		// 序列化失败，返回错误
+		log.Errorf("failed to transfer msg into byte array: %v", err)
+		cb.Done(ErrResp(err))
+		return
+	}
+	if adminReq.ChangePeer == nil {
+		// ChangePeer 字段为空，返回错误
+		err = fmt.Errorf("invalid AdminCmdType_ChangePeer request, ChangePeer is required")
+		log.Error(err)
+		cb.Done(ErrResp(err))
+		return
+	}
+	confChange := pb.ConfChange{
+		ChangeType: adminReq.ChangePeer.ChangeType,
+		NodeId:     adminReq.ChangePeer.Peer.Id,
+		Context:    data,
+	}
+	proposal := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+	d.proposals = append(d.proposals, proposal)
+
+	// 调用 ProposeConfChange 进行配置更改提议
+	err = d.RaftGroup.ProposeConfChange(confChange)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+}
+
+func (d *peerMsgHandler) handleCompactLogReq(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 请求propose到raft层
+	err := d.proposeToRaftGroup(msg, cb)
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+}
+
+// handleTransferLeaderReq 处理AdminCmdType_TransferLeader类型的领导变更请求，不用提交proposal，调用TransferLeader直接Step转发
+func (d *peerMsgHandler) handleTransferLeaderReq(adminReq *raft_cmdpb.AdminRequest, cb *message.Callback) {
+	// 调用 d.RaftGroup.TransferLeader() 发送 MsgTransferLeader 到 raft 层
+	d.RaftGroup.TransferLeader(adminReq.TransferLeader.Peer.Id)
+	// 构造TransferLeader类型的AdminResponse
+	adminResp := &raft_cmdpb.AdminResponse{
+		TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+		CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+	}
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header:        &raft_cmdpb.RaftResponseHeader{},
+		AdminResponse: adminResp,
+	}
+	cb.Done(resp)
 }
 
 func (d *peerMsgHandler) onTick() {
