@@ -371,25 +371,18 @@ func (d *peerMsgHandler) checkValidAndCallback(resp *raft_cmdpb.RaftCmdResponse,
 
 		if entry.Term < proposal.term {
 			return
-		}
-
-		if entry.Term > proposal.term {
-			proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+		} else if entry.Term > proposal.term {
+			NotifyStaleReq(proposal.term, proposal.cb)
 			d.proposals = d.proposals[1:]
 			continue
-		}
-
-		if entry.Term == proposal.term && entry.Index < proposal.index {
+		} else if entry.Index < proposal.index {
 			return
-		}
-
-		if entry.Term == proposal.term && entry.Index > proposal.index {
-			proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+		} else if entry.Index > proposal.index {
+			NotifyStaleReq(proposal.term, proposal.cb)
 			d.proposals = d.proposals[1:]
 			continue
-		}
-
-		if entry.Index == proposal.index && entry.Term == proposal.term {
+		} else {
+			//  给 Snap 请求返回一个事务
 			if snapTxn != nil {
 				proposal.cb.Txn = snapTxn[0]
 			}
